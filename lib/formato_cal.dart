@@ -2,9 +2,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:hdm_calculadora/button_values.dart';
 
-// Esta es la pantalla principal de la calculadora. Tiene 4 pasos (pestañas):
-// 1) precio, 2) marca, 3) descuento, 4) cantidad. Cada pestaña usa lo que
-// calculó la anterior, y al final todo se puede guardar en el historial.
+// Esta es la pantalla principal (y única) de la calculadora de cotizaciones.
+// La idea general: el usuario pasa por 4 pasos (pestañas), uno seguido del
+// otro, y cada paso usa el resultado del paso anterior:
+//   1) Precio original  ->  2) Marca (+ %)  ->  3) Descuento (- %)  ->  4) Cantidad (x N)
+// Al final, con el botón FIN, todo se guarda en un historial.
 class CalculatorScreen extends StatefulWidget {
   const CalculatorScreen({super.key});
 
@@ -13,40 +15,63 @@ class CalculatorScreen extends StatefulWidget {
 }
 
 class _CalculatorScreenState extends State<CalculatorScreen> {
+  // Timer que se usa solo para ir borrando del historial lo que ya
+  // cumplió 24 horas (no hay reloj visible en pantalla).
   late Timer _timer;
-  int _tabIndex = 0; // que pestaña se ve: 0 precio, 1 marca, 2 descuento, 3 cantidad
+
+  // En qué pestaña está parado el usuario ahora mismo.
+  // 0 = precio, 1 = marca, 2 = descuento, 3 = cantidad.
+  int _tabIndex = 0;
 
   // ---------- pestaña 1: precio original (todo en dolares) ----------
   final _precioOriginalCtrl = TextEditingController();
 
-  // tipo de cambio: solo de referencia, no afecta ningun calculo
+  // caja de tipo de cambio: es solo informativa (una referencia para el
+  // usuario), no participa en ninguna cuenta de la calculadora.
   final _tipoCambioCtrl = TextEditingController(text: '3.14');
 
   // ---------- pestaña 2: marca ----------
-  String? _marcaSeleccionada;
-  final _precioMarcaCtrl = TextEditingController();
-  final _porc1Ctrl = TextEditingController();
-  final _porc2Ctrl = TextEditingController();
+  String? _marcaSeleccionada; // CAT, CTP, HANDOK o IDP (se elige con el teclado)
+  final _precioMarcaCtrl = TextEditingController(); // precio que llega de la pestaña 1
+  final _marcaInputCtrl = TextEditingController(); // caja donde se escribe cada % antes de sumarlo
+  final List<double> _porcentajesMarca = []; // los % que ya se fueron aplicando (máx. 2, salvo CAT)
 
   // ---------- pestaña 3: descuento ----------
-  final _precioDescCtrl = TextEditingController();
+  final _precioDescCtrl = TextEditingController(); // precio que llega de la pestaña 2
   final _descuentoInputCtrl = TextEditingController(); // caja donde se escribe el % antes de sumarlo
   final List<double> _descuentosAplicados = []; // descuentos ya agregados con el +
 
-  // ---------- pestaña 4: cantidad (ahora va al final, no al principio) ----------
+  // ---------- pestaña 4: cantidad ----------
   final _cantidadCtrl = TextEditingController(text: '1');
 
+  // Estas 3 banderas sirven para no pisar lo que el usuario ya escribió a
+  // mano. Mientras sean "false", la app puede seguir autocompletando el
+  // campo por su cuenta; en cuanto el usuario toca algo, pasan a "true" y
+  // la app deja de tocar ese campo.
   bool _precioMarcaManual = false;
   bool _precioDescManual = false;
-  bool _cantidadManual = false; // si es false, el "1" de por defecto se borra apenas escribas
+  bool _cantidadManual = false; // ademas: si es false, el "1" de por defecto se borra apenas escribas
 
+  // Cual caja de texto esta "activa" ahora mismo: el teclado de la app le
+  // escribe a esta. Ya no hace falta tocar las cajas para elegirlas: cada
+  // vez que cambiamos de pestaña, se elige sola (ver _autoenfocarPestana).
+  // La unica excepcion es la caja de tipo de cambio, que es aparte del
+  // flujo principal y por eso hay que tocarla para poder editarla.
   TextEditingController? _campoActivo;
+
+  // Cada cotizacion que se cierra con FIN queda guardada aca, como un
+  // Map con todos los datos de esa cuenta.
   final List<Map<String, dynamic>> _historial = [];
 
   @override
   void initState() {
     super.initState();
-    // revisa cada minuto si hay cotizaciones con mas de 24 horas para borrarlas
+    // Apenas arranca la app, la pestaña 1 (precio) ya queda lista para
+    // escribir, sin necesidad de tocarla primero.
+    _campoActivo = _precioOriginalCtrl;
+
+    // Cada minuto se revisa el historial y se borran las cotizaciones
+    // que ya pasaron las 24 horas guardadas.
     _timer = Timer.periodic(const Duration(minutes: 1), (_) {
       if (!mounted) return;
       setState(() {
@@ -57,64 +82,67 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
 
   @override
   void dispose() {
+    // Hay que liberar todos los controllers cuando la pantalla se cierra,
+    // sino quedan ocupando memoria de mas.
     _timer.cancel();
     _precioOriginalCtrl.dispose();
     _cantidadCtrl.dispose();
     _tipoCambioCtrl.dispose();
     _precioMarcaCtrl.dispose();
-    _porc1Ctrl.dispose();
-    _porc2Ctrl.dispose();
+    _marcaInputCtrl.dispose();
     _precioDescCtrl.dispose();
     _descuentoInputCtrl.dispose();
     super.dispose();
   }
 
-  // convierte texto de los inputs a numero
+  // Convierte lo que hay escrito en una caja a un numero de verdad. Si la
+  // caja esta vacia o tiene algo raro, devuelve 0 en vez de romper la app.
   double _num(TextEditingController c) => double.tryParse(c.text.replaceAll(',', '.')) ?? 0;
 
-  // la cantidad nunca es 0: si está vacía vale 1
+  // La cantidad nunca puede ser 0 (no tendria sentido cotizar "0
+  // unidades"), asi que si esta vacia se usa 1 por defecto.
   double get _cantidad {
     final c = _num(_cantidadCtrl);
     return c == 0 ? 1 : c;
   }
 
-  // primer paso: precio base + primer porcentaje (CAT no usa este paso,
-  // su 18% se aplica directo y una sola vez)
-  double get _paso1Marca {
-    final precio = _num(_precioMarcaCtrl);
-    if (_marcaSeleccionada == 'CAT') return precio;
-    final p1 = _num(_porc1Ctrl);
-    return (precio + precio * (p1 / 100)).roundToDouble();
+  // Aplica una lista de porcentajes uno atras del otro sobre un precio
+  // base (encadenados: el segundo % se calcula sobre el resultado del
+  // primero, no sobre el precio original). Se redondea al entero mas
+  // cercano en cada paso. La usan tanto la marca como el descuento.
+  double _aplicarCadena(double base, List<double> porcentajes, {required bool suma}) {
+    double valor = base;
+    for (final p in porcentajes) {
+      valor = suma ? valor + valor * (p / 100) : valor - valor * (p / 100);
+      valor = valor.roundToDouble();
+    }
+    return valor;
   }
 
-  // resultado final con marca: en CTP/HANDOK/IDP el segundo porcentaje se
-  // aplica sobre el resultado del primero (en cadena), no sobre el precio
-  // original. Cada paso se redondea al entero mas cercano.
+  // Resultado final de la pestaña de marca. CAT es un caso especial: su
+  // 18% se aplica directo, una sola vez. Las demas marcas usan los
+  // porcentajes que se fueron agregando con el +, en cadena.
   double get _precioConMarca {
     final precio = _num(_precioMarcaCtrl);
     if (_marcaSeleccionada == 'CAT') {
       return (precio + precio * 0.18).roundToDouble();
     }
-    final p2 = _num(_porc2Ctrl);
-    final paso1 = _paso1Marca;
-    return (paso1 + paso1 * (p2 / 100)).roundToDouble();
+    return _aplicarCadena(precio, _porcentajesMarca, suma: true);
   }
 
-  // aplica los descuentos ya agregados, uno tras otro (en cadena)
-  double get _precioFinal {
-    double precio = _num(_precioDescCtrl);
-    for (final d in _descuentosAplicados) {
-      precio = (precio - precio * (d / 100)).roundToDouble();
-    }
-    return precio;
-  }
+  // Resultado final de la pestaña de descuento: se van restando, en
+  // cadena, todos los % que el usuario fue agregando con el +.
+  double get _precioFinal => _aplicarCadena(_num(_precioDescCtrl), _descuentosAplicados, suma: false);
 
-  // paso 4 (el ultimo): el precio ya con marca y descuento, x la cantidad
+  // Paso 4, el ultimo: el precio que ya tiene marca y descuento
+  // aplicados, multiplicado por la cantidad.
   double get _totalFinal => (_precioFinal * _cantidad).roundToDouble();
 
-  // como ya no hay flechas para ir "para atras", _tabIndex siempre dice
-  // hasta donde llego el usuario. Con eso alcanza para saber que monto
-  // mostrar si aprieta FIN sin pasar por todas las pestañas.
+  // Como ya no hay forma de "retroceder" entre pestañas (solo se avanza
+  // con el check), _tabIndex nos dice justo hasta donde llego el
+  // usuario. Sirve para saber que numero mostrar si aprieta FIN sin
+  // pasar por todas las pestañas (por ejemplo, si solo queria el precio
+  // con marca y no le importa el descuento ni la cantidad).
   double get _montoFinal {
     switch (_tabIndex) {
       case 3:
@@ -128,7 +156,10 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     }
   }
 
-  // pasa los datos automaticamente a las siguientes pestañas
+  // Copia el resultado de una pestaña al campo de precio de la
+  // siguiente, para que el usuario no tenga que volver a tipearlo. Si ya
+  // lo edito a mano, no lo pisa (por eso el chequeo de las banderas
+  // "manual").
   void _recalcularCascada() {
     if (!_precioMarcaManual) {
       _precioMarcaCtrl.text = _num(_precioOriginalCtrl).toStringAsFixed(0);
@@ -138,6 +169,28 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     }
   }
 
+  // Decide que caja de texto queda "activa" (lista para escribir) apenas
+  // se entra a cada pestaña, para no tener que tocarla primero.
+  void _autoenfocarPestana() {
+    switch (_tabIndex) {
+      case 0:
+        _campoActivo = _precioOriginalCtrl;
+        break;
+      case 1:
+        // si todavia no eligio marca, o eligio CAT (que no tiene campo
+        // para escribir, su % es fijo), no hay nada que enfocar
+        _campoActivo = (_marcaSeleccionada == null || _marcaSeleccionada == 'CAT') ? null : _marcaInputCtrl;
+        break;
+      case 2:
+        _campoActivo = _descuentoInputCtrl;
+        break;
+      case 3:
+        _campoActivo = _cantidadCtrl;
+        break;
+    }
+  }
+
+  // El texto que va arriba de la tarjeta blanca, cambia segun la pestaña.
   String get _tituloPestana {
     switch (_tabIndex) {
       case 1:
@@ -151,6 +204,7 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     }
   }
 
+  // Que widget (panel) se dibuja adentro de la tarjeta, segun la pestaña.
   Widget get _panelActual {
     switch (_tabIndex) {
       case 1:
@@ -164,15 +218,15 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     }
   }
 
-  // escribe el numero presionado en el input activo
+  // Escribe el numero que se toco en el teclado, en la caja activa.
   void _escribir(String valor) {
     if (_campoActivo == null) return;
     setState(() {
       if (_campoActivo == _cantidadCtrl && !_cantidadManual) {
-        _campoActivo!.text = valor; // reemplaza el "1" por defecto
+        _campoActivo!.text = valor; // el primer toque reemplaza el "1" por defecto
         _cantidadManual = true;
       } else {
-        _campoActivo!.text += valor;
+        _campoActivo!.text += valor; // los demas toques se van agregando al final
       }
       if (_campoActivo == _precioMarcaCtrl) _precioMarcaManual = true;
       if (_campoActivo == _precioDescCtrl) _precioDescManual = true;
@@ -180,7 +234,8 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     });
   }
 
-  // borra el ultimo caracter
+  // Borra el ultimo caracter de la caja activa (el boton naranja con el
+  // icono de flecha).
   void _borrar() {
     if (_campoActivo == null) return;
     final texto = _campoActivo!.text;
@@ -193,26 +248,50 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     });
   }
 
-  // toma lo que hay escrito en la caja de descuento, lo agrega a la lista
-  // y limpia la caja para el siguiente
+  // Toma el numero que esta escrito en la caja de marca, lo agrega a la
+  // lista de porcentajes (maximo 2, porque asi es la regla del negocio
+  // para CTP/HANDOK/IDP) y limpia la caja para poder escribir el
+  // siguiente sin tener que tocar nada.
+  void _agregarPorcentajeMarca() {
+    if (_marcaSeleccionada == null || _marcaSeleccionada == 'CAT') return;
+    if (_porcentajesMarca.length >= 2) return;
+    final valor = _num(_marcaInputCtrl);
+    if (valor <= 0) return;
+    setState(() {
+      _porcentajesMarca.add(valor);
+      _marcaInputCtrl.clear();
+      _precioMarcaManual = true;
+      _recalcularCascada();
+    });
+  }
+
+  // Quita el ultimo porcentaje de marca que se agrego.
+  void _quitarPorcentajeMarca() {
+    if (_porcentajesMarca.isEmpty) return;
+    setState(() => _porcentajesMarca.removeLast());
+  }
+
+  // Igual que el de marca, pero para los descuentos (que no tienen limite
+  // de cantidad, se puede agregar los que hagan falta).
   void _agregarDescuento() {
     final valor = _num(_descuentoInputCtrl);
     if (valor <= 0) return;
     setState(() {
       _descuentosAplicados.add(valor);
       _descuentoInputCtrl.clear();
-      if (_campoActivo == _precioDescCtrl) _precioDescManual = true;
+      _precioDescManual = true;
       _recalcularCascada();
     });
   }
 
-  // quita el ultimo descuento que se agrego
+  // Quita el ultimo descuento que se agrego.
   void _quitarDescuento() {
     if (_descuentosAplicados.isEmpty) return;
     setState(() => _descuentosAplicados.removeLast());
   }
 
-  // limpia toda la pantalla
+  // Vuelve toda la pantalla al estado inicial, para empezar una
+  // cotizacion nueva desde cero (boton RES).
   void _resetear() {
     setState(() {
       _precioOriginalCtrl.clear();
@@ -220,19 +299,20 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
       _cantidadManual = false;
       _marcaSeleccionada = null;
       _precioMarcaCtrl.clear();
-      _porc1Ctrl.clear();
-      _porc2Ctrl.clear();
+      _marcaInputCtrl.clear();
+      _porcentajesMarca.clear();
       _precioDescCtrl.clear();
       _descuentoInputCtrl.clear();
       _descuentosAplicados.clear();
-      _campoActivo = null;
       _tabIndex = 0;
       _precioMarcaManual = false;
       _precioDescManual = false;
+      _autoenfocarPestana();
     });
   }
 
-  // el check avisa que se guardo esa pestaña y pasa a la siguiente sola
+  // El check (✓): avisa con un mensajito que se guardaron los datos de
+  // esta pestaña, y pasa solo a la siguiente (si no es la ultima).
   void _confirmarPestana() {
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
     ScaffoldMessenger.of(context).showSnackBar(
@@ -248,14 +328,17 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
       setState(() {
         _tabIndex++;
         _recalcularCascada();
+        _autoenfocarPestana();
       });
     }
   }
 
-  // guarda la ficha de la cotizacion con cada operacion realizada
+  // El FIN: junta todos los datos de la cotizacion actual (hasta donde
+  // haya llegado el usuario) y los guarda como una ficha nueva en el
+  // historial. Despues limpia la pantalla para la siguiente cotizacion.
   void _guardarEnHistorial() {
-    // como no hay vuelta atras entre pestañas, _tabIndex nos dice
-    // exactamente hasta donde llego el usuario esta vez
+    // Como no hay vuelta atras entre pestañas, _tabIndex nos dice
+    // exactamente hasta donde llego el usuario esta vez.
     final huboMarca = _tabIndex >= 1 && _marcaSeleccionada != null;
     final huboDescuento = _tabIndex >= 2;
     final huboCantidad = _tabIndex >= 3;
@@ -266,10 +349,8 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
         'precioOriginal': _num(_precioOriginalCtrl),
         'marca': huboMarca ? _marcaSeleccionada : null,
         'esCat': huboMarca ? esCat : null,
-        'porc1': huboMarca ? (esCat ? 18.0 : _num(_porc1Ctrl)) : null,
-        'porc2': huboMarca ? (esCat ? null : _num(_porc2Ctrl)) : null,
         'precioAntesMarca': huboMarca ? _num(_precioMarcaCtrl) : null,
-        'paso1Marca': huboMarca ? _paso1Marca : null,
+        'porcentajesMarca': huboMarca ? (esCat ? <double>[18.0] : List<double>.from(_porcentajesMarca)) : <double>[],
         'precioConMarca': huboMarca ? _precioConMarca : null,
         'precioAntesDescuento': huboDescuento ? _num(_precioDescCtrl) : null,
         'descuentos': huboDescuento ? List<double>.from(_descuentosAplicados) : <double>[],
@@ -282,7 +363,7 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     _resetear();
   }
 
-  // abre el panel de abajo (bottom sheet) con la lista del historial
+  // Abre el panel de abajo (bottom sheet) con la lista del historial.
   void _mostrarHistorial() {
     showModalBottomSheet(
       context: context,
@@ -297,7 +378,23 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     );
   }
 
-  // arma una tarjeta por cotizacion, mostrando la cuenta tal cual se hizo
+  // Arma el texto de una "cadena" de porcentajes para mostrar en el
+  // historial, tipo "$100 +10% = $110  →  +15% = $127". Sirve tanto para
+  // la marca (suma) como para el descuento (resta).
+  String _textoCadena(double base, List<double> porcentajes, {required bool suma}) {
+    final partes = <String>['\$ ${base.toStringAsFixed(0)}'];
+    double valor = base;
+    for (final p in porcentajes) {
+      valor = suma ? valor + valor * (p / 100) : valor - valor * (p / 100);
+      valor = valor.roundToDouble();
+      final signo = suma ? '+' : '-';
+      partes.add('$signo${p.toStringAsFixed(0)}% = \$ ${valor.toStringAsFixed(0)}');
+    }
+    return partes.join('   →   ');
+  }
+
+  // Arma la lista de tarjetas del historial: una por cada cotizacion
+  // guardada, mostrando la cuenta completa tal cual se hizo.
   Widget _cuerpoHistorial() {
     if (_historial.isEmpty) {
       return const Padding(
@@ -310,18 +407,18 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
       padding: const EdgeInsets.symmetric(vertical: 10),
       itemCount: _historial.length,
       itemBuilder: (_, i) {
-        final item = _historial[_historial.length - 1 - i];
+        final item = _historial[_historial.length - 1 - i]; // el mas nuevo arriba
         final fecha = item['fecha'] as DateTime;
         final fechaTexto = '${fecha.day.toString().padLeft(2, '0')}/${fecha.month.toString().padLeft(2, '0')}/${fecha.year}  '
             '${fecha.hour.toString().padLeft(2, '0')}:${fecha.minute.toString().padLeft(2, '0')}';
 
-        // lee un numero del historial sin importar si quedo guardado como
-        // int o double, asi nunca truena el cast
+        // lee un numero del historial sin importar si quedo guardado
+        // como int o double, asi nunca truena el cast
         double num_(String key) => (item[key] as num?)?.toDouble() ?? 0;
-        bool esCatGuardado() => item['esCat'] as bool? ?? false;
 
         final precioOriginal = num_('precioOriginal').toStringAsFixed(0);
         final marca = item['marca'] as String?;
+        final porcentajesMarca = ((item['porcentajesMarca'] as List?) ?? []).map((d) => (d as num).toDouble()).toList();
         final descuentos = ((item['descuentos'] as List?) ?? []).map((d) => (d as num).toDouble()).toList();
         final huboCantidad = item['cantidad'] != null;
         final precioFinal = num_('precioFinal').toStringAsFixed(0);
@@ -344,20 +441,9 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
                 Text(fechaTexto, style: const TextStyle(color: Colors.amber, fontWeight: FontWeight.bold, fontSize: 14.5)),
                 const SizedBox(height: 8),
                 linea('Precio original:  \$ $precioOriginal'),
-                if (marca != null)
-                  linea(
-                    esCatGuardado()
-                        ? 'Marca $marca:  \$ ${num_('precioAntesMarca').toStringAsFixed(0)}'
-                            '  +  18%'
-                            '  =  \$ ${num_('precioConMarca').toStringAsFixed(0)}'
-                        : 'Marca $marca:  \$ ${num_('precioAntesMarca').toStringAsFixed(0)}'
-                            '  +${num_('porc1').toStringAsFixed(0)}%  =  \$ ${num_('paso1Marca').toStringAsFixed(0)}'
-                            '   →   +${num_('porc2').toStringAsFixed(0)}%  =  \$ ${num_('precioConMarca').toStringAsFixed(0)}',
-                  ),
+                if (marca != null) linea('Marca $marca:  ${_textoCadena(num_('precioAntesMarca'), porcentajesMarca, suma: true)}'),
                 if (descuentos.isNotEmpty)
-                  linea('Descuento:  \$ ${num_('precioAntesDescuento').toStringAsFixed(0)}  '
-                      '${descuentos.map((d) => '-  ${d.toStringAsFixed(0)}%').join('  ')}'
-                      '  =  \$ ${num_('precioTrasDescuento').toStringAsFixed(0)}'),
+                  linea('Descuento:  ${_textoCadena(num_('precioAntesDescuento'), descuentos, suma: false)}'),
                 if (huboCantidad)
                   linea('Cantidad:  \$ ${num_('precioTrasDescuento').toStringAsFixed(0)}'
                       '  x  ${num_('cantidad').toStringAsFixed(0)}'
@@ -375,10 +461,11 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
 
   // ---------------- widgets reutilizables ----------------
 
-  // esta es la "caja" que se repite en casi toda la app (precio, cantidad,
-  // porcentajes...). No es un TextField de verdad: solo muestra texto y,
-  // al tocarla, se marca como el campo activo para que el teclado de la
-  // app escriba ahi. unidad decide si se ve con $, con % o solo el numero.
+  // Esta es la "caja" que se repite en casi toda la app (precio,
+  // cantidad...). No es un TextField de verdad: solo muestra texto, y
+  // como ahora cada pestaña se autoenfoca sola, normalmente no hace
+  // falta tocarla (se puede tocar igual, por si se quiere corregir algo
+  // a mano). unidad decide si se ve con $, con % o solo el numero.
   Widget _campo(String label, TextEditingController ctrl,
       {bool readOnly = false, bool atenuado = false, String unidad = '\$'}) {
     final deshabilitado = readOnly || atenuado;
@@ -415,8 +502,9 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     );
   }
 
-  // caja de tipo de cambio: solo informativa, se puede tocar y editar
-  // con el mismo teclado de la app, pero no entra en ningun calculo
+  // Caja de tipo de cambio: es la unica que sigue necesitando que la
+  // toques para poder escribir, porque no forma parte del flujo de las
+  // 4 pestañas (es solo una referencia aparte, siempre visible arriba).
   Widget _cajaTipoCambio() {
     final activo = _campoActivo == _tipoCambioCtrl;
     return GestureDetector(
@@ -442,7 +530,8 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     );
   }
 
-  // caja de solo lectura, se usa para mostrar el 18% fijo de la marca CAT
+  // Caja de solo lectura, se usa para mostrar el 18% fijo de la marca CAT
+  // (esa marca no tiene nada para escribir, su porcentaje ya viene fijo).
   Widget _campoFijo(String label, String valor) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -458,7 +547,8 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     );
   }
 
-  // texto chico gris, para mostrar la cuenta (ej: "100 x 3")
+  // Texto chico gris, para mostrar la cuenta que se esta haciendo
+  // (por ejemplo "100 x 3"), arriba del resultado grande.
   Widget _formula(String texto) => SizedBox(
         width: double.infinity,
         child: Text(
@@ -468,7 +558,7 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
         ),
       );
 
-  // el numero grande y negro que se ve como resultado de cada pestaña
+  // El numero grande y negro que se ve como resultado de cada pestaña.
   Widget _resultado(String texto) => SizedBox(
         width: double.infinity,
         child: Text(
@@ -478,9 +568,83 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
         ),
       );
 
+  // Caja con un "%" y dos botones circulares (+ y -), que se repite en
+  // marca y en descuento: escribis el numero, tocas + y se agrega a la
+  // lista (y la caja se limpia sola para el siguiente); con el - se
+  // borra el ultimo que agregaste.
+  Widget _cajaMasBotones({
+    required TextEditingController ctrl,
+    required VoidCallback onSumar,
+    required VoidCallback onQuitar,
+  }) {
+    final activo = _campoActivo == ctrl;
+    return GestureDetector(
+      onTap: () => setState(() => _campoActivo = ctrl),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+        decoration: BoxDecoration(
+          color: const Color(0xFF4A4A4A),
+          borderRadius: BorderRadius.circular(14),
+          border: activo ? Border.all(color: const Color(0xFFFDBD00), width: 2) : null,
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                ctrl.text.isEmpty ? '%' : '${ctrl.text} %',
+                style: TextStyle(
+                  color: ctrl.text.isEmpty ? Colors.white38 : Colors.white,
+                  fontWeight: FontWeight.w800,
+                  fontSize: 23,
+                ),
+              ),
+            ),
+            _botonMasMenos('+', onSumar, const Color(0xFFFDBD00)),
+            const SizedBox(width: 8),
+            _botonMasMenos('−', onQuitar, const Color(0xFF6A6A6A)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Chip amarillo que muestra la lista de porcentajes ya agregados,
+  // separados por coma (ej: "10%, 20%").
+  Widget _chipPorcentajes(List<double> valores) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(color: const Color(0xFFFDBD00), borderRadius: BorderRadius.circular(14)),
+      child: Text(
+        valores.map((d) => '${d.toStringAsFixed(0)}%').join(', '),
+        style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 20),
+      ),
+    );
+  }
+
+  // El bloque final resaltado con fondo verde, para el precio final de
+  // verdad (el que aparece en la ultima pestaña, la de cantidad).
+  Widget _bloquePrecioFinal(double monto) {
+    return Center(
+      child: Column(
+        children: [
+          const Text('PRECIO FINAL', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: Color(0xFF888888), letterSpacing: 1)),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
+            decoration: BoxDecoration(color: const Color(0xFFDFF3E3), borderRadius: BorderRadius.circular(18)),
+            child: Text(
+              '\$ ${monto.toStringAsFixed(0)}',
+              style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 44, color: Color(0xFF2E7D4F)),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ---------------- las 4 pestañas ----------------
 
-  // pestaña 1: solo el precio original (todo en dolares)
+  // Pestaña 1: solo el precio original (todo en dolares).
   Widget _panelPrecio() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -501,9 +665,10 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     );
   }
 
-  // pestaña 2: se elige una marca desde el teclado y se le suma su
-  // porcentaje al precio. CAT es un solo paso (18%); las demas marcas
-  // son dos pasos, uno atras del otro (ver _paso1Marca y _precioConMarca)
+  // Pestaña 2: se elige una marca desde el teclado (arriba de los
+  // numeros) y se le suma su porcentaje al precio. CAT es un solo paso
+  // fijo (18%); las demas marcas dejan agregar hasta 2 porcentajes, uno
+  // atras del otro (el segundo se calcula sobre el resultado del primero).
   Widget _panelMarca() {
     if (_marcaSeleccionada == null) {
       return Center(
@@ -522,71 +687,44 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        esCat
-            ? _campoFijo('% marca (CAT)', '18 %')
-            : Row(
-                children: [
-                  Expanded(child: _campo('Porcentaje 1 (%)', _porc1Ctrl, unidad: '%')),
-                  const SizedBox(width: 12),
-                  Expanded(child: _campo('Porcentaje 2 (%)', _porc2Ctrl, unidad: '%')),
-                ],
-              ),
+        if (esCat)
+          _campoFijo('% marca (CAT)', '18 %')
+        else
+          _cajaMasBotones(
+            ctrl: _marcaInputCtrl,
+            onSumar: _agregarPorcentajeMarca,
+            onQuitar: _quitarPorcentajeMarca,
+          ),
+        if (!esCat && _porcentajesMarca.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          _chipPorcentajes(_porcentajesMarca),
+        ],
         const SizedBox(height: 16),
         _formula(esCat
             ? '\$ ${_num(_precioMarcaCtrl).toStringAsFixed(0)}   +   18%'
-            : '\$ ${_num(_precioMarcaCtrl).toStringAsFixed(0)}  +${_num(_porc1Ctrl).toStringAsFixed(0)}%  =  \$ ${_paso1Marca.toStringAsFixed(0)}   →   +${_num(_porc2Ctrl).toStringAsFixed(0)}%'),
+            : _textoCadena(_num(_precioMarcaCtrl), _porcentajesMarca, suma: true)),
         const SizedBox(height: 6),
         _resultado('= \$ ${_precioConMarca.toStringAsFixed(0)}'),
       ],
     );
   }
 
+  // Pestaña 3: se van agregando descuentos (los que hagan falta) con el
+  // mismo sistema de caja + botones que la marca.
   Widget _panelDescuento() {
-    final activo = _campoActivo == _descuentoInputCtrl;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         const Text('Descuentos (%)', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: Color(0xFF555555))),
         const SizedBox(height: 6),
-        // recuadro unico: escribis el % y lo sumas con el +
-        GestureDetector(
-          onTap: () => setState(() => _campoActivo = _descuentoInputCtrl),
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-            decoration: BoxDecoration(
-              color: const Color(0xFF4A4A4A),
-              borderRadius: BorderRadius.circular(14),
-              border: activo ? Border.all(color: const Color(0xFFFDBD00), width: 2) : null,
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    _descuentoInputCtrl.text.isEmpty ? '%' : '${_descuentoInputCtrl.text} %',
-                    style: TextStyle(
-                      color: _descuentoInputCtrl.text.isEmpty ? Colors.white38 : Colors.white,
-                      fontWeight: FontWeight.w800,
-                      fontSize: 23,
-                    ),
-                  ),
-                ),
-                _botonMasMenos('+', _agregarDescuento, const Color(0xFFFDBD00)),
-                const SizedBox(width: 8),
-                _botonMasMenos('−', _quitarDescuento, const Color(0xFF6A6A6A)),
-              ],
-            ),
-          ),
+        _cajaMasBotones(
+          ctrl: _descuentoInputCtrl,
+          onSumar: _agregarDescuento,
+          onQuitar: _quitarDescuento,
         ),
         if (_descuentosAplicados.isNotEmpty) ...[
           const SizedBox(height: 12),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            decoration: BoxDecoration(color: const Color(0xFFFDBD00), borderRadius: BorderRadius.circular(14)),
-            child: Text(
-              _descuentosAplicados.map((d) => '${d.toStringAsFixed(0)}%').join(', '),
-              style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 20),
-            ),
-          ),
+          _chipPorcentajes(_descuentosAplicados),
         ],
         const SizedBox(height: 18),
         _resultado('= \$ ${_precioFinal.toStringAsFixed(0)}'),
@@ -594,7 +732,7 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     );
   }
 
-  // pestaña 4 (la ultima): el precio que quedo despues de marca y
+  // Pestaña 4 (la ultima): el precio que quedo despues de marca y
   // descuento, multiplicado por la cantidad. Aca se ve el precio final
   // de verdad, bien resaltado.
   Widget _panelCantidad() {
@@ -607,27 +745,13 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
         const SizedBox(height: 14),
         const Divider(height: 1, color: Color(0xFFDDDDDD)),
         const SizedBox(height: 14),
-        Center(
-          child: Column(
-            children: [
-              const Text('PRECIO FINAL', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: Color(0xFF888888), letterSpacing: 1)),
-              const SizedBox(height: 8),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
-                decoration: BoxDecoration(color: const Color(0xFFDFF3E3), borderRadius: BorderRadius.circular(18)),
-                child: Text(
-                  '\$ ${_totalFinal.toStringAsFixed(0)}',
-                  style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 44, color: Color(0xFF2E7D4F)),
-                ),
-              ),
-            ],
-          ),
-        ),
+        _bloquePrecioFinal(_totalFinal),
       ],
     );
   }
 
-  // botones circulares + y - de la pestaña de descuento
+  // Botones circulares chiquitos de + y -, usados dentro de
+  // _cajaMasBotones (marca y descuento).
   Widget _botonMasMenos(String simbolo, VoidCallback onTap, Color color) {
     return GestureDetector(
       onTap: onTap,
@@ -642,12 +766,14 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     );
   }
 
+  // ---------------- pantalla completa ----------------
+
   @override
   Widget build(BuildContext context) {
     final screenSize = MediaQuery.of(context).size;
     final displayWidth = screenSize.width * 0.96;
     final displayHeight = screenSize.height * 0.36;
-    final filaAltura = screenSize.width / 6.2;
+    final filaAltura = screenSize.width / 6.2; // alto de cada fila de botones del teclado
 
     return Scaffold(
       backgroundColor: const Color(0xFF161616),
@@ -657,7 +783,7 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
           mainAxisAlignment: MainAxisAlignment.start,
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            // logo
+            // logo de la empresa arriba de todo
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8.0),
               child: Center(
@@ -676,7 +802,7 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
                 ),
               ),
             ),
-            // historial, minimalista
+            // boton de Historial + caja de tipo de cambio
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 6.0),
               child: Row(
@@ -696,7 +822,7 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
                 ],
               ),
             ),
-            // tarjeta con la pestaña activa
+            // tarjeta blanca con la pestaña que este activa
             Center(
               child: Container(
                 width: displayWidth,
@@ -717,7 +843,8 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
               ),
             ),
             const SizedBox(height: 10),
-            // teclado: marcas arriba, numeros a la izquierda y acciones al costado
+            // teclado: fila de marcas arriba, numeros a la izquierda y
+            // botones de accion (atras, res, fin, check) a la derecha
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 6.0, vertical: 2.0),
               child: Column(
@@ -780,6 +907,8 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     );
   }
 
+  // Dibuja un boton del teclado: decide de que color se pinta segun que
+  // tipo de boton es, y que funcion se llama cuando lo tocan.
   Widget buildButton(String value) {
     final isNumber = RegExp(r'^\d$').hasMatch(value);
     final marcaSet = {Btn.btnCat, Btn.btnCtp, Btn.btnHandok, Btn.btnIdp};
@@ -850,6 +979,7 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
               setState(() {
                 _marcaSeleccionada = value.trim();
                 _recalcularCascada();
+                _autoenfocarPestana();
               });
             } else if (value == Btn.btnAtras) {
               _borrar();
@@ -873,7 +1003,6 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
     );
   }
 }
-
 
  // quitar el reloj y es su lugar el tipo de cambio como 3.35 y que este sea modificable 
  // las marcas que esten arriba de lo numerico y los otros bonones a los costados del numerico

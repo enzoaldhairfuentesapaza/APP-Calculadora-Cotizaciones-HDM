@@ -101,3 +101,79 @@ assets/
  ├─ logo.png              → logo que se ve arriba de la pantalla
  └─ icono.png             → ícono de la app (ver sección de abajo)
 ```
+
+## Cómo poner el ícono de la app (el que se ve en el home del celular)
+
+Ya tienes `icono.png` dentro de `assets/`, pero ese archivo por sí solo
+**no** cambia el ícono del home — hay que generarlo con un paquete
+aparte, porque Android e iOS necesitan el ícono en varios tamaños
+distintos (no un solo PNG). Los pasos:
+
+1. Abre `pubspec.yaml` y agrega esta dependencia de desarrollo (en la
+   sección `dev_dependencies`, junto a `flutter_test`):
+
+   ```yaml
+   dev_dependencies:
+     flutter_test:
+       sdk: flutter
+     flutter_launcher_icons: ^0.13.1
+   ```
+
+2. Más abajo en el mismo archivo (fuera de `dependencies`/`dev_dependencies`,
+   al mismo nivel que `flutter:`), agrega esta configuración:
+
+   ```yaml
+   flutter_launcher_icons:
+     android: true
+     ios: true
+     image_path: "assets/icono.png"
+   ```
+
+3. En la terminal, dentro de la carpeta del proyecto:
+
+   ```bash
+   flutter pub get
+   flutter pub run flutter_launcher_icons
+   ```
+
+   Este comando genera solo los íconos y reemplaza los que ya existen en
+   `android/app/src/main/res/` y `ios/Runner/Assets.xcassets/`.
+
+4. Vuelve a instalar la app (`flutter run` o reinstalando el `.apk`)
+   para ver el ícono nuevo — si el celular queda mostrando el ícono
+   viejo, suele bastar con desinstalar la app y volver a instalarla.
+
+*Consejo:* para que el ícono se vea bien en Android (que recorta los
+íconos en formas distintas según el celular), `icono.png` debería ser
+cuadrado y de al menos 512x512 píxeles, con el diseño centrado y sin
+texto pegado a los bordes.
+
+## Cómo cambiar el nombre de la app (el que se ve en el home)
+
+El `title` que está en `main.dart` (`DH&DM Calculadora`) solo se usa
+puertas adentro de Flutter — no es lo que se ve como nombre debajo del
+ícono en el celular. Ese nombre se cambia en otros dos archivos:
+
+**Android** — abre `android/app/src/main/AndroidManifest.xml` y busca la
+etiqueta `<application ...>`. Cambia el atributo `android:label`:
+
+```xml
+<application
+    android:label="DH&amp;DM Calculadora"
+    ...>
+```
+
+(Nota el `&amp;` en vez de `&`: en XML el símbolo `&` solo no es válido,
+hay que escribirlo así.)
+
+**iOS** — abre `ios/Runner/Info.plist` y busca la clave
+`CFBundleDisplayName` (o agrégala si no existe):
+
+```xml
+<key>CFBundleDisplayName</key>
+<string>DH&DM Calculadora</string>
+```
+
+Si quieres, súbeme esos dos archivos (`AndroidManifest.xml` e
+`Info.plist`) junto con tu `pubspec.yaml`, y te dejo los tres ya
+editados y listos para reemplazar.
